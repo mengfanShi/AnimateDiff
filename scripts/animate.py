@@ -6,12 +6,13 @@ from omegaconf import OmegaConf
 
 import torch
 import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
 
 import diffusers
 from diffusers import AutoencoderKL, DDIMScheduler
 
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, logging
 
 from animatediff.models.unet import UNet3DConditionModel
 from animatediff.models.sparse_controlnet import SparseControlNetModel
@@ -26,13 +27,14 @@ import csv, pdb, glob, math
 from pathlib import Path
 from PIL import Image
 import numpy as np
+import cv2
 
 
 @torch.no_grad()
 def main(args):
     *_, func_args = inspect.getargvalues(inspect.currentframe())
     func_args = dict(func_args)
-    
+
     time_str = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     savedir = f"samples/{Path(args.config).stem}-{time_str}"
     os.makedirs(savedir)
@@ -41,6 +43,7 @@ def main(args):
     samples = []
 
     # create validation pipeline
+    logging.set_verbosity_error()
     tokenizer    = CLIPTokenizer.from_pretrained(args.pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_path, subfolder="text_encoder").cuda()
     vae          = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae").cuda()
@@ -50,16 +53,19 @@ def main(args):
         model_config.W = model_config.get("W", args.W)
         model_config.H = model_config.get("H", args.H)
         model_config.L = model_config.get("L", args.L)
+        model_config.C = model_config.get("C", args.C)
 
         inference_config = OmegaConf.load(model_config.get("inference_config", args.inference_config))
         unet = UNet3DConditionModel.from_pretrained_2d(args.pretrained_model_path, subfolder="unet", unet_additional_kwargs=OmegaConf.to_container(inference_config.unet_additional_kwargs)).cuda()
 
         # load controlnet model
         controlnet = controlnet_images = None
+        video_as_control = False
+        controlnet_image_index = model_config.get("controlnet_image_indexs", [0])
         if model_config.get("controlnet_path", "") != "":
             assert model_config.get("controlnet_images", "") != ""
             assert model_config.get("controlnet_config", "") != ""
-            
+
             unet.config.num_attention_heads = 8
             unet.config.projection_class_embeddings_input_dim = None
 
@@ -73,16 +79,25 @@ def main(args):
             controlnet.load_state_dict(controlnet_state_dict)
             controlnet.cuda()
 
-            image_paths = model_config.controlnet_images
+            image_paths = model_config.controlnet_images if model_config.controlnet_images is not None else []
             if isinstance(image_paths, str): image_paths = [image_paths]
 
+            video_path = None
+            video_extension = ('.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.m4v', '.webm', '.mpeg', '.mpg')
+            for path in image_paths:
+                if (os.path.splitext(path)[1].lower() in video_extension):
+                    video_as_control = True
+                    video_path = path
+                    break
+
+            if video_as_control: image_paths = [video_path]
             print(f"controlnet image paths:")
             for path in image_paths: print(path)
             assert len(image_paths) <= model_config.L
 
             image_transforms = transforms.Compose([
                 transforms.RandomResizedCrop(
-                    (model_config.H, model_config.W), (1.0, 1.0), 
+                    (model_config.H, model_config.W), (1.0, 1.0),
                     ratio=(model_config.W/model_config.H, model_config.W/model_config.H)
                 ),
                 transforms.ToTensor(),
@@ -95,8 +110,31 @@ def main(args):
                     image /= image.max()
                     return image
             else: image_norm = lambda x: x
-                
-            controlnet_images = [image_norm(image_transforms(Image.open(path).convert("RGB"))) for path in image_paths]
+
+            if video_as_control:
+                cap = cv2.VideoCapture(video_path)
+                video_length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                model_config.L = video_length
+                controlnet_image_index = range(video_length)
+                controlnet_images = []
+                not_valid = []
+                for i in range(model_config.L):
+                    ret, frame = cap.read()
+                    if not ret:
+                        not_valid.append(i)
+                        continue
+
+                    pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    controlnet_images.append(image_norm(image_transforms(pil_image)))
+                # controlnet_image_index = [val if val >= 0 else video_length + val for val in controlnet_image_index]
+                controlnet_image_index = [idx for idx in controlnet_image_index if idx not in not_valid]
+
+                if args.stride > 1:
+                    controlnet_image_index = controlnet_image_index[::args.stride]
+                    controlnet_images = controlnet_images[::args.stride]
+            else:
+                # controlnet_image_index = [val if val >= 0 else model_config.L + val for val in controlnet_image_index]
+                controlnet_images = [image_norm(image_transforms(Image.open(path).convert("RGB"))) for path in image_paths]
 
             os.makedirs(os.path.join(savedir, "control_images"), exist_ok=True)
             for i, image in enumerate(controlnet_images):
@@ -108,8 +146,22 @@ def main(args):
             if controlnet.use_simplified_condition_embedding:
                 num_controlnet_images = controlnet_images.shape[2]
                 controlnet_images = rearrange(controlnet_images, "b c f h w -> (b f) c h w")
-                controlnet_images = vae.encode(controlnet_images * 2. - 1.).latent_dist.sample() * 0.18215
-                controlnet_images = rearrange(controlnet_images, "(b f) c h w -> b c f h w", f=num_controlnet_images)
+
+                # split to batch to save memory
+                batch_size = 16
+                if (controlnet_images.shape[0] > batch_size):
+                    dataloader = DataLoader(controlnet_images, batch_size=batch_size)
+                    encoded_images = []
+                    with torch.no_grad():
+                        for batch in dataloader:
+                            batch_encoded = vae.encode(batch * 2. - 1.).latent_dist.sample() * 0.18215
+                            encoded_images.append(batch_encoded)
+
+                    encoded_images = torch.cat(encoded_images, dim=0)
+                    controlnet_images = rearrange(encoded_images, "(b f) c h w -> b c f h w", f=num_controlnet_images)
+                else:
+                    controlnet_images = vae.encode(controlnet_images * 2. - 1.).latent_dist.sample() * 0.18215
+                    controlnet_images = rearrange(controlnet_images, "(b f) c h w -> b c f h w", f=num_controlnet_images)
 
         # set xformers
         if is_xformers_available() and (not args.without_xformers):
@@ -138,19 +190,19 @@ def main(args):
 
         prompts      = model_config.prompt
         n_prompts    = list(model_config.n_prompt) * len(prompts) if len(model_config.n_prompt) == 1 else model_config.n_prompt
-        
+
         random_seeds = model_config.get("seed", [-1])
         random_seeds = [random_seeds] if isinstance(random_seeds, int) else list(random_seeds)
         random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
-        
+
         config[model_idx].random_seed = []
         for prompt_idx, (prompt, n_prompt, random_seed) in enumerate(zip(prompts, n_prompts, random_seeds)):
-            
+
             # manually set random seed for reproduction
             if random_seed != -1: torch.manual_seed(random_seed)
             else: torch.seed()
             config[model_idx].random_seed.append(torch.initial_seed())
-            
+
             print(f"current seed: {torch.initial_seed()}")
             print(f"sampling {prompt} ...")
             sample = pipeline(
@@ -161,16 +213,18 @@ def main(args):
                 width               = model_config.W,
                 height              = model_config.H,
                 video_length        = model_config.L,
+                context_frames      = model_config.C,
 
                 controlnet_images = controlnet_images,
-                controlnet_image_index = model_config.get("controlnet_image_indexs", [0]),
+                controlnet_image_index = controlnet_image_index,
+                stride = args.stride if video_as_control else 1,
             ).videos
             samples.append(sample)
 
             prompt = "-".join((prompt.replace("/", "").split(" ")[:10]))
             save_videos_grid(sample, f"{savedir}/sample/{sample_idx}-{prompt}.gif")
             print(f"save to {savedir}/sample/{prompt}.gif")
-            
+
             sample_idx += 1
 
     samples = torch.concat(samples)
@@ -182,12 +236,14 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained-model-path", type=str, default="models/StableDiffusion/stable-diffusion-v1-5",)
-    parser.add_argument("--inference-config",      type=str, default="configs/inference/inference-v1.yaml")    
+    parser.add_argument("--inference-config",      type=str, default="configs/inference/inference-v3.yaml")
     parser.add_argument("--config",                type=str, required=True)
-    
+
     parser.add_argument("--L", type=int, default=16 )
     parser.add_argument("--W", type=int, default=512)
     parser.add_argument("--H", type=int, default=512)
+    parser.add_argument("--C", type=int, default=16, help="module context length")
+    parser.add_argument("--stride", type=int, default=1, help="stride while video control")
 
     parser.add_argument("--without-xformers", action="store_true")
 

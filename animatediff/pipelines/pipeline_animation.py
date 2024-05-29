@@ -29,7 +29,8 @@ from einops import rearrange
 
 from ..models.unet import UNet3DConditionModel
 from ..models.sparse_controlnet import SparseControlNetModel
-import pdb
+from .context_scheduler import get_context_scheduler, get_total_steps
+from ..ip_adapter.ip_adapter import IPAdapter
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -338,6 +339,18 @@ class AnimationPipeline(DiffusionPipeline):
         controlnet_images: torch.FloatTensor = None,
         controlnet_image_index: list = [0],
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+        stride: int = 1,
+
+        # support infinite frames
+        context_frames: int = 16,
+        context_stride: int = 3,
+        context_overlap: int = 4,
+        context_schedule: str = "uniform",
+
+        # support ip adapter
+        ip_adapter: IPAdapter = None,
+        ipadapter_images: torch.FloatTensor = None,
+        ipadapter_image_index: list = [0],
 
         **kwargs,
     ):
@@ -365,8 +378,8 @@ class AnimationPipeline(DiffusionPipeline):
         # Encode input prompt
         prompt = prompt if isinstance(prompt, list) else [prompt] * batch_size
         if negative_prompt is not None:
-            negative_prompt = negative_prompt if isinstance(negative_prompt, list) else [negative_prompt] * batch_size 
-        text_embeddings = self._encode_prompt(
+            negative_prompt = negative_prompt if isinstance(negative_prompt, list) else [negative_prompt] * batch_size
+        prompt_embeddings = self._encode_prompt(
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )
 
@@ -382,7 +395,7 @@ class AnimationPipeline(DiffusionPipeline):
             video_length,
             height,
             width,
-            text_embeddings.dtype,
+            prompt_embeddings.dtype,
             device,
             generator,
             latents,
@@ -392,65 +405,161 @@ class AnimationPipeline(DiffusionPipeline):
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        # Infinite generate support
+        context_scheduler = get_context_scheduler(context_schedule)
+        total_steps = get_total_steps(
+            context_scheduler,
+            timesteps,
+            num_inference_steps,
+            latents.shape[2],
+            context_frames,
+            context_stride,
+            context_overlap,
+            closed_loop=True
+        )
+
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        with self.progress_bar(total=total_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                # calculate total noise_pred for infinite length
+                noise_pred_total = torch.zeros(
+                    (latents.shape[0] * (2 if do_classifier_free_guidance else 1), *latents.shape[1:]),
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
+                counter = torch.zeros((1, 1, latents.shape[2], 1, 1), device=latents.device, dtype=latents.dtype)
 
-                down_block_additional_residuals = mid_block_additional_residual = None
-                if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
-                    assert controlnet_images.dim() == 5
+                for context in context_scheduler(
+                    i, num_inference_steps, latents.shape[2], context_frames, context_stride, context_overlap
+                ):
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([latents[:,:,context]] * 2) if do_classifier_free_guidance else latents[:,:,context]
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    controlnet_noisy_latents = latent_model_input
-                    controlnet_prompt_embeds = text_embeddings
+                    # TODO:ip adapter
+                    if (ip_adapter is not None) and (ipadapter_images is not None):
+                        assert ipadapter_images.dim() == 5
+                        index_common = set(ipadapter_image_index) & set(context)
+                        image_index = [val for val in ipadapter_image_index if val in index_common]
+                        context_index = [context.index(val) for val in image_index]
 
-                    controlnet_images = controlnet_images.to(latents.device)
 
-                    controlnet_cond_shape    = list(controlnet_images.shape)
-                    controlnet_cond_shape[2] = video_length
-                    controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
 
-                    controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
-                    controlnet_conditioning_mask_shape[1] = 1
-                    controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
+                    down_block_additional_residuals = mid_block_additional_residual = None
+                    if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
+                        assert controlnet_images.dim() == 5
 
-                    assert controlnet_images.shape[2] >= len(controlnet_image_index)
-                    controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
-                    controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
+                        controlnet_noisy_latents = latent_model_input
+                        controlnet_prompt_embeds = prompt_embeddings
 
-                    down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
-                        controlnet_noisy_latents, t,
-                        encoder_hidden_states=controlnet_prompt_embeds,
-                        controlnet_cond=controlnet_cond,
-                        conditioning_mask=controlnet_conditioning_mask,
-                        conditioning_scale=controlnet_conditioning_scale,
-                        guess_mode=False, return_dict=False,
-                    )
+                        controlnet_images = controlnet_images.to(latents.device)
 
-                # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input, t, 
-                    encoder_hidden_states=text_embeddings,
-                    down_block_additional_residuals = down_block_additional_residuals,
-                    mid_block_additional_residual   = mid_block_additional_residual,
-                ).sample.to(dtype=latents_dtype)
+                        controlnet_cond_shape    = list(controlnet_images.shape)
+                        controlnet_cond_shape[2] = len(context)
+                        controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
+
+                        controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
+                        controlnet_conditioning_mask_shape[1] = 1
+                        controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
+
+                        index_common = set(controlnet_image_index) & set(context)
+                        image_index = [val for val in controlnet_image_index if val in index_common]
+                        context_index = [context.index(val) for val in image_index]
+
+                        assert controlnet_images.shape[2] >= len(image_index)
+                        controlnet_cond[:,:,context_index] = controlnet_images[:,:,[idx // stride for idx in image_index]]
+                        controlnet_conditioning_mask[:,:,context_index] = 1
+
+                        down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
+                            controlnet_noisy_latents, t,
+                            encoder_hidden_states=controlnet_prompt_embeds,
+                            controlnet_cond=controlnet_cond,
+                            conditioning_mask=controlnet_conditioning_mask,
+                            conditioning_scale=controlnet_conditioning_scale,
+                            guess_mode=False, return_dict=False,
+                        )
+
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input, t,
+                        encoder_hidden_states=prompt_embeddings,
+                        down_block_additional_residuals = down_block_additional_residuals,
+                        mid_block_additional_residual   = mid_block_additional_residual,
+                    ).sample.to(dtype=latents_dtype)
+
+                    noise_pred_total[:, :, context] += noise_pred
+                    counter[:, :, context] += 1
+                    progress_bar.update()
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    noise_pred_uncond, noise_pred_text = (noise_pred_total / counter).chunk(2)
+                    noise_pred_total = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                latents = self.scheduler.step(noise_pred_total, t, latents, **extra_step_kwargs).prev_sample
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
+
+                # # expand the latents if we are doing classifier free guidance
+                # latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                # latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # down_block_additional_residuals = mid_block_additional_residual = None
+                # if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
+                #     assert controlnet_images.dim() == 5
+
+                #     controlnet_noisy_latents = latent_model_input
+                #     controlnet_prompt_embeds = prompt_embeddings
+
+                #     controlnet_images = controlnet_images.to(latents.device)
+
+                #     controlnet_cond_shape    = list(controlnet_images.shape)
+                #     controlnet_cond_shape[2] = video_length
+                #     controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
+
+                #     controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
+                #     controlnet_conditioning_mask_shape[1] = 1
+                #     controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
+
+                #     assert controlnet_images.shape[2] >= len(controlnet_image_index)
+                #     controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
+                #     controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
+
+                #     down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
+                #         controlnet_noisy_latents, t,
+                #         encoder_hidden_states=controlnet_prompt_embeds,
+                #         controlnet_cond=controlnet_cond,
+                #         conditioning_mask=controlnet_conditioning_mask,
+                #         conditioning_scale=controlnet_conditioning_scale,
+                #         guess_mode=False, return_dict=False,
+                #     )
+
+                # # predict the noise residual
+                # noise_pred = self.unet(
+                #     latent_model_input, t,
+                #     encoder_hidden_states=prompt_embeddings,
+                #     down_block_additional_residuals = down_block_additional_residuals,
+                #     mid_block_additional_residual   = mid_block_additional_residual,
+                # ).sample.to(dtype=latents_dtype)
+
+                # # perform guidance
+                # if do_classifier_free_guidance:
+                #     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                #     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # # compute the previous noisy sample x_t -> x_t-1
+                # latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+
+                # # call the callback, if provided
+                # if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                #     progress_bar.update()
+                #     if callback is not None and i % callback_steps == 0:
+                #         callback(i, t, latents)
 
         # Post-processing
         video = self.decode_latents(latents)
