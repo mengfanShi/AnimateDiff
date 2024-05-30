@@ -340,6 +340,7 @@ class AnimationPipeline(DiffusionPipeline):
         controlnet_image_index: list = [0],
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         stride: int = 1,
+        video_control: bool = False,
 
         # support infinite frames
         context_frames: int = 16,
@@ -437,15 +438,6 @@ class AnimationPipeline(DiffusionPipeline):
                     latent_model_input = torch.cat([latents[:,:,context]] * 2) if do_classifier_free_guidance else latents[:,:,context]
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    # TODO:ip adapter
-                    if (ip_adapter is not None) and (ipadapter_images is not None):
-                        assert ipadapter_images.dim() == 5
-                        index_common = set(ipadapter_image_index) & set(context)
-                        image_index = [val for val in ipadapter_image_index if val in index_common]
-                        context_index = [context.index(val) for val in image_index]
-
-
-
                     down_block_additional_residuals = mid_block_additional_residual = None
                     if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
                         assert controlnet_images.dim() == 5
@@ -468,8 +460,11 @@ class AnimationPipeline(DiffusionPipeline):
                         context_index = [context.index(val) for val in image_index]
 
                         assert controlnet_images.shape[2] >= len(image_index)
-                        controlnet_cond[:,:,context_index] = controlnet_images[:,:,[idx // stride for idx in image_index]]
                         controlnet_conditioning_mask[:,:,context_index] = 1
+                        if video_control:
+                            controlnet_cond[:,:,context_index] = controlnet_images[:,:,[idx // stride for idx in image_index]]
+                        else:
+                            controlnet_cond[:,:,context_index] = controlnet_images[:,:,:len(image_index)]
 
                         down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
                             controlnet_noisy_latents, t,
@@ -478,6 +473,17 @@ class AnimationPipeline(DiffusionPipeline):
                             conditioning_mask=controlnet_conditioning_mask,
                             conditioning_scale=controlnet_conditioning_scale,
                             guess_mode=False, return_dict=False,
+                        )
+
+                    # TODO:ip adapter
+                    if (ip_adapter is not None) and (ipadapter_images is not None):
+                        index_common = set(ipadapter_image_index) & set(context)
+                        image_index = [val for val in ipadapter_image_index if val in index_common]
+
+                        assert len(ipadapter_images) >= len(image_index)
+                        prompt_embeddings = ip_adapter.get_prompt_embeds_with_text(
+                            ipadapter_images[image_index],
+                            text_embeds=prompt_embeddings,
                         )
 
                     # predict the noise residual

@@ -162,6 +162,27 @@ class IPAdapter:
 
         return output
 
+    def get_prompt_embeds_with_text(self, images, negative_images=None, text_embeds=None, weight=[]):
+        prompt_embeds, negative_prompt_embeds = self.get_image_embeds(images, negative_images=negative_images)
+
+        if any(e != 1.0 for e in weight):
+            weight = torch.tensor(weight).unsqueeze(-1).unsqueeze(-1)
+            weight = weight.to(self.device)
+            prompt_embeds = prompt_embeds * weight
+
+        if prompt_embeds.shape[0] > 1:
+            prompt_embeds = torch.cat(prompt_embeds.chunk(prompt_embeds.shape[0]), dim=1)
+        if negative_prompt_embeds.shape[0] > 1:
+            negative_prompt_embeds = torch.cat(negative_prompt_embeds.chunk(negative_prompt_embeds.shape[0]), dim=1)
+
+        if text_embeds is not None:
+            prompt_embeds = torch.cat((text_embeds[0], prompt_embeds), dim=1)
+            negative_prompt_embeds = torch.cat((text_embeds[1], negative_prompt_embeds), dim=1)
+
+        output = torch.cat(prompt_embeds, negative_prompt_embeds)
+
+        return output
+
     def set_scale(self, scale):
         for attn_processor in self.pipe.unet.attn_processors.values():
             if isinstance(attn_processor, IPAttnProcessor):

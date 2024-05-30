@@ -126,14 +126,14 @@ def main(args):
 
                     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     controlnet_images.append(image_norm(image_transforms(pil_image)))
-                # controlnet_image_index = [val if val >= 0 else video_length + val for val in controlnet_image_index]
+                controlnet_image_index = [val if val >= 0 else video_length + val for val in controlnet_image_index]
                 controlnet_image_index = [idx for idx in controlnet_image_index if idx not in not_valid]
 
                 if args.stride > 1:
                     controlnet_image_index = controlnet_image_index[::args.stride]
                     controlnet_images = controlnet_images[::args.stride]
             else:
-                # controlnet_image_index = [val if val >= 0 else model_config.L + val for val in controlnet_image_index]
+                controlnet_image_index = [val if val >= 0 else model_config.L + val for val in controlnet_image_index]
                 controlnet_images = [image_norm(image_transforms(Image.open(path).convert("RGB"))) for path in image_paths]
 
             os.makedirs(os.path.join(savedir, "control_images"), exist_ok=True)
@@ -217,7 +217,8 @@ def main(args):
 
                 controlnet_images = controlnet_images,
                 controlnet_image_index = controlnet_image_index,
-                stride = args.stride if video_as_control else 1,
+                video_control = video_as_control,
+                stride = args.stride,
             ).videos
             samples.append(sample)
 
