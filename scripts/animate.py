@@ -8,8 +8,7 @@ import torch
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
-import diffusers
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionImg2ImgPipeline
 
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer, logging
@@ -23,7 +22,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 from einops import rearrange, repeat
 
-import csv, pdb, glob, math
+import csv, pdb, glob, math, gc
 from pathlib import Path
 from PIL import Image
 import numpy as np
@@ -125,7 +124,7 @@ def main(args):
                         continue
 
                     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    controlnet_images.append(image_norm(image_transforms(pil_image)))
+                    controlnet_images.append(pil_image)
                 controlnet_image_index = [val if val >= 0 else video_length + val for val in controlnet_image_index]
                 controlnet_image_index = [idx for idx in controlnet_image_index if idx not in not_valid]
 
@@ -134,12 +133,32 @@ def main(args):
                     controlnet_images = controlnet_images[::args.stride]
             else:
                 controlnet_image_index = [val if val >= 0 else model_config.L + val for val in controlnet_image_index]
-                controlnet_images = [image_norm(image_transforms(Image.open(path).convert("RGB"))) for path in image_paths]
+                controlnet_images = [Image.open(path).convert("RGB") for path in image_paths]
 
             os.makedirs(os.path.join(savedir, "control_images"), exist_ok=True)
             for i, image in enumerate(controlnet_images):
-                Image.fromarray((255. * (image.numpy().transpose(1,2,0))).astype(np.uint8)).save(f"{savedir}/control_images/{i}.png")
+                time_str = datetime.datetime.now().strftime("T%H-%M-%S")
+                image.save(f"{savedir}/control_images/{i}_{time_str}.png")
 
+            # transform image style
+            if model_config.get("dreambooth_path", "") != "":
+                print(f"transform controlnet images with {model_config.dreambooth_path} ...")
+                img2img_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(args.pretrained_model_path).to("cuda")
+                img2img_pipe = load_weights(img2img_pipe, dreambooth_model_path=model_config.dreambooth_path).to("cuda")
+                os.makedirs(os.path.join(savedir, "transformed_images"), exist_ok=True)
+
+                with torch.no_grad():
+                    for i, image in enumerate(controlnet_images):
+                        transformed_image = img2img_pipe(prompt="", image=image, strength=0.5).images[0]
+                        time_str = datetime.datetime.now().strftime("T%H-%M-%S")
+                        transformed_image.save(f"{savedir}/transformed_images/{i}_{time_str}.png")
+                        controlnet_images[i] = transformed_image
+
+                del img2img_pipe
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            controlnet_images = [image_norm(image_transforms(image)) for image in controlnet_images]
             controlnet_images = torch.stack(controlnet_images).unsqueeze(0).cuda()
             controlnet_images = rearrange(controlnet_images, "b f c h w -> b c f h w")
 

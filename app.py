@@ -40,7 +40,7 @@ css = """
 
 class AnimateController:
     def __init__(self):
-        
+
         # config dirs
         self.basedir                = os.getcwd()
         self.stable_diffusion_dir   = os.path.join(self.basedir, "models", "StableDiffusion")
@@ -53,11 +53,11 @@ class AnimateController:
         self.stable_diffusion_list   = []
         self.motion_module_list      = []
         self.personalized_model_list = []
-        
+
         self.refresh_stable_diffusion()
         self.refresh_motion_module()
         self.refresh_personalized_model()
-        
+
         # config models
         self.tokenizer             = None
         self.text_encoder          = None
@@ -65,7 +65,7 @@ class AnimateController:
         self.unet                  = None
         self.pipeline              = None
         self.lora_model_state_dict = {}
-        
+
         self.inference_config      = OmegaConf.load("configs/inference/inference.yaml")
 
     def refresh_stable_diffusion(self):
@@ -107,7 +107,7 @@ class AnimateController:
             with safe_open(base_model_dropdown, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     base_model_state_dict[key] = f.get_tensor(key)
-                    
+
             converted_vae_checkpoint = convert_ldm_vae_checkpoint(base_model_state_dict, self.vae.config)
             self.vae.load_state_dict(converted_vae_checkpoint)
 
@@ -133,19 +133,19 @@ class AnimateController:
         motion_module_dropdown,
         base_model_dropdown,
         lora_alpha_slider,
-        prompt_textbox, 
-        negative_prompt_textbox, 
-        sampler_dropdown, 
-        sample_step_slider, 
-        width_slider, 
-        length_slider, 
-        height_slider, 
-        cfg_scale_slider, 
+        prompt_textbox,
+        negative_prompt_textbox,
+        sampler_dropdown,
+        sample_step_slider,
+        width_slider,
+        length_slider,
+        height_slider,
+        cfg_scale_slider,
         seed_textbox
-    ):    
+    ):
         if self.unet is None:
             raise gr.Error(f"Please select a pretrained model path.")
-        if motion_module_dropdown == "": 
+        if motion_module_dropdown == "":
             raise gr.Error(f"Please select a motion module.")
         if base_model_dropdown == "":
             raise gr.Error(f"Please select a base DreamBooth model.")
@@ -156,7 +156,7 @@ class AnimateController:
             vae=self.vae, text_encoder=self.text_encoder, tokenizer=self.tokenizer, unet=self.unet,
             scheduler=scheduler_dict[sampler_dropdown](**OmegaConf.to_container(self.inference_config.noise_scheduler_kwargs))
         ).to("cuda")
-        
+
         if self.lora_model_state_dict != {}:
             pipeline = convert_lora(pipeline, self.lora_model_state_dict, alpha=lora_alpha_slider)
 
@@ -165,7 +165,7 @@ class AnimateController:
         if seed_textbox != -1 and seed_textbox != "": torch.manual_seed(int(seed_textbox))
         else: torch.seed()
         seed = torch.initial_seed()
-        
+
         sample = pipeline(
             prompt_textbox,
             negative_prompt     = negative_prompt_textbox,
@@ -178,7 +178,7 @@ class AnimateController:
 
         save_sample_path = os.path.join(self.savedir_sample, f"{sample_idx}.mp4")
         save_videos_grid(sample, save_sample_path)
-    
+
         sample_config = {
             "prompt": prompt_textbox,
             "n_prompt": negative_prompt_textbox,
@@ -194,9 +194,9 @@ class AnimateController:
         with open(os.path.join(self.savedir, "logs.json"), "a") as f:
             f.write(json_str)
             f.write("\n\n")
-            
+
         return gr.Video.update(value=save_sample_path)
-        
+
 
 controller = AnimateController()
 
@@ -223,7 +223,7 @@ def ui():
                     interactive=True,
                 )
                 stable_diffusion_dropdown.change(fn=controller.update_stable_diffusion, inputs=[stable_diffusion_dropdown], outputs=[stable_diffusion_dropdown])
-                
+
                 stable_diffusion_refresh_button = gr.Button(value="\U0001F503", elem_classes="toolbutton")
                 def update_stable_diffusion():
                     controller.refresh_stable_diffusion()
@@ -237,20 +237,20 @@ def ui():
                     interactive=True,
                 )
                 motion_module_dropdown.change(fn=controller.update_motion_module, inputs=[motion_module_dropdown], outputs=[motion_module_dropdown])
-                
+
                 motion_module_refresh_button = gr.Button(value="\U0001F503", elem_classes="toolbutton")
                 def update_motion_module():
                     controller.refresh_motion_module()
                     return gr.Dropdown.update(choices=controller.motion_module_list)
                 motion_module_refresh_button.click(fn=update_motion_module, inputs=[], outputs=[motion_module_dropdown])
-                
+
                 base_model_dropdown = gr.Dropdown(
                     label="Select base Dreambooth model (required)",
                     choices=controller.personalized_model_list,
                     interactive=True,
                 )
                 base_model_dropdown.change(fn=controller.update_base_model, inputs=[base_model_dropdown], outputs=[base_model_dropdown])
-                
+
                 lora_model_dropdown = gr.Dropdown(
                     label="Select LoRA model (optional)",
                     choices=["none"] + controller.personalized_model_list,
@@ -258,9 +258,9 @@ def ui():
                     interactive=True,
                 )
                 lora_model_dropdown.change(fn=controller.update_lora_model, inputs=[lora_model_dropdown], outputs=[lora_model_dropdown])
-                
+
                 lora_alpha_slider = gr.Slider(label="LoRA alpha", value=0.8, minimum=0, maximum=2, interactive=True)
-                
+
                 personalized_refresh_button = gr.Button(value="\U0001F503", elem_classes="toolbutton")
                 def update_personalized_model():
                     controller.refresh_personalized_model()
@@ -276,28 +276,28 @@ def ui():
                 ### 2. Configs for AnimateDiff.
                 """
             )
-            
+
             prompt_textbox = gr.Textbox(label="Prompt", lines=2)
             negative_prompt_textbox = gr.Textbox(label="Negative prompt", lines=2)
-                
+
             with gr.Row().style(equal_height=False):
                 with gr.Column():
                     with gr.Row():
                         sampler_dropdown   = gr.Dropdown(label="Sampling method", choices=list(scheduler_dict.keys()), value=list(scheduler_dict.keys())[0])
                         sample_step_slider = gr.Slider(label="Sampling steps", value=25, minimum=10, maximum=100, step=1)
-                        
+
                     width_slider     = gr.Slider(label="Width",            value=512, minimum=256, maximum=1024, step=64)
                     height_slider    = gr.Slider(label="Height",           value=512, minimum=256, maximum=1024, step=64)
                     length_slider    = gr.Slider(label="Animation length", value=16,  minimum=8,   maximum=24,   step=1)
                     cfg_scale_slider = gr.Slider(label="CFG Scale",        value=7.5, minimum=0,   maximum=20)
-                    
+
                     with gr.Row():
                         seed_textbox = gr.Textbox(label="Seed", value=-1)
                         seed_button  = gr.Button(value="\U0001F3B2", elem_classes="toolbutton")
                         seed_button.click(fn=lambda: gr.Textbox.update(value=random.randint(1, 1e8)), inputs=[], outputs=[seed_textbox])
-            
+
                     generate_button = gr.Button(value="Generate", variant='primary')
-                    
+
                 result_video = gr.Video(label="Generated Animation", interactive=False)
 
             generate_button.click(
@@ -307,22 +307,22 @@ def ui():
                     motion_module_dropdown,
                     base_model_dropdown,
                     lora_alpha_slider,
-                    prompt_textbox, 
-                    negative_prompt_textbox, 
-                    sampler_dropdown, 
-                    sample_step_slider, 
-                    width_slider, 
-                    length_slider, 
-                    height_slider, 
-                    cfg_scale_slider, 
+                    prompt_textbox,
+                    negative_prompt_textbox,
+                    sampler_dropdown,
+                    sample_step_slider,
+                    width_slider,
+                    length_slider,
+                    height_slider,
+                    cfg_scale_slider,
                     seed_textbox,
                 ],
                 outputs=[result_video]
             )
-            
+
     return demo
 
 
 if __name__ == "__main__":
     demo = ui()
-    demo.launch(share=True)
+    demo.launch(share=False, server_port=8878)
