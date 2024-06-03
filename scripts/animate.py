@@ -144,6 +144,9 @@ def main(args):
             # transform image style
             if model_config.get("dreambooth_path", "") != "":
                 print(f"transform controlnet images with {model_config.dreambooth_path} ...")
+                img2img_seed = model_config.get("seed", [-1])
+                if img2img_seed[0] != -1: torch.manual_seed(img2img_seed[0])
+                img2img_n_prompt = list(model_config.n_prompt)[0]
 
                 # image to text
                 image_prompts = []
@@ -151,7 +154,7 @@ def main(args):
                 clip_config.apply_low_vram_defaults()
                 ci = Interrogator(clip_config)
                 for image in controlnet_images:
-                    image_prompts.append(ci.interrogate(image))
+                    image_prompts.append(ci.interrogate_fast(image))
                 del ci, clip_config
                 torch.cuda.empty_cache()
                 gc.collect()
@@ -166,7 +169,9 @@ def main(args):
 
                 for i, image in enumerate(controlnet_images):
                     image = image.resize((model_config.W, model_config.H))
-                    transformed_image = img2img_pipe(prompt=image_prompts[i], image=image, strength=0.3).images[0]
+                    transformed_image = img2img_pipe(
+                        prompt=image_prompts[i], image=image, strength=0.3, negative_prompt=img2img_n_prompt,
+                        num_inference_steps=model_config.steps, guidance_scale=model_config.guidance_scale).images[0]
                     time_str = datetime.datetime.now().strftime("T%H-%M-%S")
                     transformed_image.save(f"{savedir}/transformed_images/{i}_{time_str}.png")
                     controlnet_images[i] = transformed_image
