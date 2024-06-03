@@ -9,6 +9,9 @@ ossutil_output/
 
 scripts/*
 !scripts/animate.py
+!scripts/transfer.py
+
+configs/prompts/v3/*
 
 *.ipynb
 *.safetensors

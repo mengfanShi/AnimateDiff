@@ -21,6 +21,7 @@ from animatediff.utils.util import load_weights
 from diffusers.utils.import_utils import is_xformers_available
 
 from einops import rearrange, repeat
+from clip_interrogator import Config, Interrogator
 
 import csv, pdb, glob, math, gc
 from pathlib import Path
@@ -143,16 +144,32 @@ def main(args):
             # transform image style
             if model_config.get("dreambooth_path", "") != "":
                 print(f"transform controlnet images with {model_config.dreambooth_path} ...")
+
+                # image to text
+                image_prompts = []
+                clip_config = Config(clip_model_name="ViT-L-14/openai")
+                clip_config.apply_low_vram_defaults()
+                ci = Interrogator(clip_config)
+                for image in controlnet_images:
+                    image_prompts.append(ci.interrogate(image))
+                del ci, clip_config
+                torch.cuda.empty_cache()
+                gc.collect()
+
+                with open(f"{savedir}/prompts.txt", 'w') as prompt_file:
+                    prompt_file.write("\n".join(image_prompts))
+
+                # build img2img
                 img2img_pipe = StableDiffusionImg2ImgPipeline.from_pretrained(args.pretrained_model_path).to("cuda")
                 img2img_pipe = load_weights(img2img_pipe, dreambooth_model_path=model_config.dreambooth_path).to("cuda")
                 os.makedirs(os.path.join(savedir, "transformed_images"), exist_ok=True)
 
-                with torch.no_grad():
-                    for i, image in enumerate(controlnet_images):
-                        transformed_image = img2img_pipe(prompt="", image=image, strength=0.5).images[0]
-                        time_str = datetime.datetime.now().strftime("T%H-%M-%S")
-                        transformed_image.save(f"{savedir}/transformed_images/{i}_{time_str}.png")
-                        controlnet_images[i] = transformed_image
+                for i, image in enumerate(controlnet_images):
+                    image = image.resize((model_config.W, model_config.H))
+                    transformed_image = img2img_pipe(prompt=image_prompts[i], image=image, strength=0.3).images[0]
+                    time_str = datetime.datetime.now().strftime("T%H-%M-%S")
+                    transformed_image.save(f"{savedir}/transformed_images/{i}_{time_str}.png")
+                    controlnet_images[i] = transformed_image
 
                 del img2img_pipe
                 torch.cuda.empty_cache()
