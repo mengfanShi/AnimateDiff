@@ -1,13 +1,13 @@
-import os, io, csv, math, random
+import os, csv, random, sys
 import numpy as np
-from einops import rearrange
 from decord import VideoReader
-
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data.dataset import Dataset
-from animatediff.utils.util import zero_rank_print
 
+dir_path = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.dirname(os.path.dirname(dir_path)))
+from animatediff.utils.util import zero_rank_print, save_videos_grid
 
 
 class WebVid10M(Dataset):
@@ -27,7 +27,7 @@ class WebVid10M(Dataset):
         self.sample_stride   = sample_stride
         self.sample_n_frames = sample_n_frames
         self.is_image        = is_image
-        
+
         sample_size = tuple(sample_size) if not isinstance(sample_size, int) else (sample_size, sample_size)
         self.pixel_transforms = transforms.Compose([
             transforms.RandomHorizontalFlip(),
@@ -35,15 +35,15 @@ class WebVid10M(Dataset):
             transforms.CenterCrop(sample_size),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
         ])
-    
+
     def get_batch(self, idx):
         video_dict = self.dataset[idx]
-        videoid, name, page_dir = video_dict['videoid'], video_dict['name'], video_dict['page_dir']
-        
+        videoid, name = video_dict['videoid'], video_dict['name']
+
         video_dir    = os.path.join(self.video_folder, f"{videoid}.mp4")
         video_reader = VideoReader(video_dir)
         video_length = len(video_reader)
-        
+
         if not self.is_image:
             clip_length = min(video_length, (self.sample_n_frames - 1) * self.sample_stride + 1)
             start_idx   = random.randint(0, video_length - clip_length)
@@ -57,7 +57,7 @@ class WebVid10M(Dataset):
 
         if self.is_image:
             pixel_values = pixel_values[0]
-        
+
         return pixel_values, name
 
     def __len__(self):
@@ -77,21 +77,18 @@ class WebVid10M(Dataset):
         return sample
 
 
-
 if __name__ == "__main__":
-    from animatediff.utils.util import save_videos_grid
-
     dataset = WebVid10M(
-        csv_path="/mnt/petrelfs/guoyuwei/projects/datasets/webvid/results_2M_val.csv",
-        video_folder="/mnt/petrelfs/guoyuwei/projects/datasets/webvid/2M_val",
+        csv_path="dataset/test.csv",
+        video_folder="dataset/test",
         sample_size=256,
         sample_stride=4, sample_n_frames=16,
-        is_image=True,
+        is_image=False,
     )
-    import pdb
-    pdb.set_trace()
-    
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=4, num_workers=16,)
+    # import pdb
+    # pdb.set_trace()
+
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=4, num_workers=0)
     for idx, batch in enumerate(dataloader):
         print(batch["pixel_values"].shape, len(batch["text"]))
         # for i in range(batch["pixel_values"].shape[0]):

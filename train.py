@@ -10,10 +10,10 @@ import subprocess
 
 from pathlib import Path
 from tqdm.auto import tqdm
-from einops import rearrange
+from einops import rearrange, repeat
 from omegaconf import OmegaConf
 from safetensors import safe_open
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import torch
 import torchvision
@@ -23,7 +23,6 @@ from torch.optim.swa_utils import AveragedModel
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-import diffusers
 from diffusers import AutoencoderKL, DDIMScheduler
 from diffusers.models import UNet2DConditionModel
 from diffusers.pipelines import StableDiffusionPipeline
@@ -31,14 +30,18 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 
-import transformers
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from animatediff.data.dataset import WebVid10M
 from animatediff.models.unet import UNet3DConditionModel
 from animatediff.pipelines.pipeline_animation import AnimationPipeline
 from animatediff.utils.util import save_videos_grid, zero_rank_print
-
+from animatediff.utils.convert_from_ckpt import \
+    convert_ldm_unet_checkpoint, convert_ldm_vae_checkpoint, convert_ldm_clip_checkpoint
+from animatediff.utils.convert_state_dict_to_diffusers import convert_state_dict_to_diffusers
+from peft import get_peft_model, LoraConfig
+from peft.utils import get_peft_model_state_dict
+from collections import OrderedDict
 
 
 def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
@@ -49,7 +52,7 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
         local_rank = rank % num_gpus
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend=backend, **kwargs)
-        
+
     elif launcher == 'slurm':
         proc_id = int(os.environ['SLURM_PROCID'])
         ntasks = int(os.environ['SLURM_NTASKS'])
@@ -66,21 +69,42 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
         os.environ['MASTER_PORT'] = str(port)
         dist.init_process_group(backend=backend)
         zero_rank_print(f"proc_id: {proc_id}; local_rank: {local_rank}; ntasks: {ntasks}; node_list: {node_list}; num_gpus: {num_gpus}; addr: {addr}; port: {port}")
-        
+
     else:
         raise NotImplementedError(f'Not implemented launcher type: `{launcher}`!')
-    
+
     return local_rank
 
+
+def load_checkpoint(path, unet, vae, text_encoder):
+    if path.endswith(".ckpt"):
+        state_dict = torch.load(path)
+        unet.load_state_dict(state_dict)
+    elif path.endswith(".safetensors"):
+        state_dict = {}
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+
+        base_state_dict = state_dict
+        # vae
+        converted_vae_checkpoint = convert_ldm_vae_checkpoint(base_state_dict, vae.config)
+        vae.load_state_dict(converted_vae_checkpoint)
+        # unet
+        converted_unet_checkpoint = convert_ldm_unet_checkpoint(base_state_dict, unet.config)
+        unet.load_state_dict(converted_unet_checkpoint, strict=False)
+        # text_model
+        text_encoder = convert_ldm_clip_checkpoint(base_state_dict)
+        return unet, vae, text_encoder
 
 
 def main(
     image_finetune: bool,
-    
+
     name: str,
     use_wandb: bool,
     launcher: str,
-    
+
     output_dir: str,
     pretrained_model_path: str,
 
@@ -88,12 +112,13 @@ def main(
     validation_data: Dict,
     cfg_random_null_text: bool = True,
     cfg_random_null_text_ratio: float = 0.1,
-    
+
+    dreambooth_path = None,
     unet_checkpoint_path: str = "",
     unet_additional_kwargs: Dict = {},
     ema_decay: float = 0.9999,
     noise_scheduler_kwargs = None,
-    
+
     max_train_epoch: int = -1,
     max_train_steps: int = 100,
     validation_steps: int = 100,
@@ -117,6 +142,15 @@ def main(
     checkpointing_epochs: int = 5,
     checkpointing_steps: int = -1,
 
+    motion_module = None,
+    motion_module_pe_multiplier = 1,
+
+    train_lora: bool = False,
+    lora_rank: int = 32,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.1,
+    lora_target_modules: List[str] = ["to_q"],
+
     mixed_precision_training: bool = True,
     enable_xformers_memory_efficient_attention: bool = True,
 
@@ -133,7 +167,7 @@ def main(
 
     seed = global_seed + global_rank
     torch.manual_seed(seed)
-    
+
     # Logging folder
     folder_name = "debug" if is_debug else name + datetime.datetime.now().strftime("-%Y-%m-%dT%H-%M-%S")
     output_dir = os.path.join(output_dir, folder_name)
@@ -168,12 +202,46 @@ def main(
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
     if not image_finetune:
         unet = UNet3DConditionModel.from_pretrained_2d(
-            pretrained_model_path, subfolder="unet", 
+            pretrained_model_path, subfolder="unet",
             unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs)
         )
     else:
         unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
-        
+
+    if dreambooth_path is not None and os.path.exists(dreambooth_path):
+        unet, vae, text_encoder = load_checkpoint(dreambooth_path, unet, vae, text_encoder)
+
+    if motion_module is not None and not image_finetune:
+        motion_module_state_dict = torch.load(motion_module, map_location="cpu")
+
+        # Multiply pe weights by multiplier for training more than 24 frames
+        if motion_module_pe_multiplier > 1:
+            for key in motion_module_state_dict:
+                if 'pe' in key:
+                    t = motion_module_state_dict[key]
+                    t = repeat(t, "b f d -> b (f m) d", m=motion_module_pe_multiplier)
+                    motion_module_state_dict[key] = t
+
+        if "global_step" in motion_module_state_dict: zero_rank_print(f"global_step: {motion_module_state_dict['global_step']}")
+        missing, unexpected = unet.load_state_dict(motion_module_state_dict, strict=False)
+        assert len(unexpected) == 0
+
+    # Freeze vae and text_encoder
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.requires_grad_(False)
+
+    # Train lora
+    if train_lora:
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=list(lora_target_modules),
+            lora_dropout=lora_dropout,
+            task_type="TEXT_TO_IMAGE"
+        )
+        unet = get_peft_model(unet, lora_config)
+
     # Load pretrained unet weights
     if unet_checkpoint_path != "":
         zero_rank_print(f"from checkpoint: {unet_checkpoint_path}")
@@ -184,19 +252,17 @@ def main(
         m, u = unet.load_state_dict(state_dict, strict=False)
         zero_rank_print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
         assert len(u) == 0
-        
-    # Freeze vae and text_encoder
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    
-    # Set unet trainable parameters
-    unet.requires_grad_(False)
-    for name, param in unet.named_parameters():
-        for trainable_module_name in trainable_modules:
-            if trainable_module_name in name:
+    else:
+        # Set unet trainable parameters
+        for name, param in unet.named_parameters():
+            if "lora_" in name:
                 param.requires_grad = True
-                break
-            
+            else:
+                for trainable_module_name in trainable_modules:
+                    if trainable_module_name in name:
+                        param.requires_grad = True
+                        break
+
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -207,6 +273,7 @@ def main(
     )
 
     if is_main_process:
+        zero_rank_print(f"trainable params: {trainable_params}")
         zero_rank_print(f"trainable params number: {len(trainable_params)}")
         zero_rank_print(f"trainable params scale: {sum(p.numel() for p in trainable_params) / 1e6:.3f} M")
 
@@ -226,7 +293,7 @@ def main(
     text_encoder.to(local_rank)
 
     # Get the training dataset
-    train_dataset = WebVid10M(**train_data, is_image=image_finetune)
+    train_dataset = WebVid10M(**OmegaConf.to_container(train_data), is_image=image_finetune)
     distributed_sampler = DistributedSampler(
         train_dataset,
         num_replicas=num_processes,
@@ -250,7 +317,7 @@ def main(
     if max_train_steps == -1:
         assert max_train_epoch != -1
         max_train_steps = max_train_epoch * len(train_dataloader)
-        
+
     if checkpointing_steps == -1:
         assert checkpointing_epochs != -1
         checkpointing_steps = checkpointing_epochs * len(train_dataloader)
@@ -306,16 +373,16 @@ def main(
     progress_bar.set_description("Steps")
 
     # Support mixed-precision training
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision_training else None
+    scaler = torch.amp.GradScaler("cuda") if mixed_precision_training else None
 
     for epoch in range(first_epoch, num_train_epochs):
         train_dataloader.sampler.set_epoch(epoch)
         unet.train()
-        
+
         for step, batch in enumerate(train_dataloader):
             if cfg_random_null_text:
                 batch['text'] = [name if random.random() > cfg_random_null_text_ratio else "" for name in batch['text']]
-                
+
             # Data batch sanity check
             if epoch == first_epoch and step == 0:
                 pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
@@ -328,10 +395,10 @@ def main(
                     for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
                         pixel_value = pixel_value / 2. + 0.5
                         torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
-                    
+
             ### >>>> Training >>>> ###
-            
-            # Convert videos to latent space            
+
+            # Convert videos to latent space
             pixel_values = batch["pixel_values"].to(local_rank)
             video_length = pixel_values.shape[1]
             with torch.no_grad():
@@ -349,22 +416,22 @@ def main(
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
-            
+
             # Sample a random timestep for each video
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             timesteps = timesteps.long()
-            
+
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            
+
             # Get the text embedding for conditioning
             with torch.no_grad():
                 prompt_ids = tokenizer(
                     batch['text'], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
                 ).input_ids.to(latents.device)
                 encoder_hidden_states = text_encoder(prompt_ids)[0]
-                
+
             # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise
@@ -375,7 +442,7 @@ def main(
 
             # Predict the noise residual and compute loss
             # Mixed-precision training
-            with torch.cuda.amp.autocast(enabled=mixed_precision_training):
+            with torch.amp.autocast("cuda", enabled=mixed_precision_training):
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
@@ -400,34 +467,42 @@ def main(
             lr_scheduler.step()
             progress_bar.update(1)
             global_step += 1
-            
+
             ### <<<< Training <<<< ###
-            
+
             # Wandb logging
             if is_main_process and (not is_debug) and use_wandb:
                 wandb.log({"train_loss": loss.item()}, step=global_step)
-                
+
             # Save checkpoint
-            if is_main_process and (global_step % checkpointing_steps == 0 or step == len(train_dataloader) - 1):
+            if is_main_process and (global_step % checkpointing_steps == 0 or global_step == max_train_steps):
                 save_path = os.path.join(output_dir, f"checkpoints")
                 state_dict = {
                     "epoch": epoch,
                     "global_step": global_step,
                     "state_dict": unet.state_dict(),
                 }
-                if step == len(train_dataloader) - 1:
-                    torch.save(state_dict, os.path.join(save_path, f"checkpoint-epoch-{epoch+1}.ckpt"))
+                if global_step % checkpointing_steps == 0:
+                    torch.save(state_dict, os.path.join(save_path, f"checkpoint-step-{global_step}.ckpt"))
+                    if train_lora:
+                        unet.module.save_pretrained(os.path.join(save_path, f"lora-step-{global_step}"))
+                    if motion_module is not None:
+                        save_mm(unet, os.path.join(save_path, f"motion_module-step-{global_step}.ckpt"))
                 else:
                     torch.save(state_dict, os.path.join(save_path, f"checkpoint.ckpt"))
+                    if train_lora:
+                        unet.module.save_pretrained(os.path.join(save_path, f"lora"))
+                    if motion_module is not None:
+                        save_mm(unet, os.path.join(save_path, f"motion_module.ckpt"))
                 logging.info(f"Saved state to {save_path} (global_step: {global_step})")
-                
+
             # Periodically validation
             if is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
                 samples = []
-                
+
                 generator = torch.Generator(device=latents.device)
                 generator.manual_seed(global_seed)
-                
+
                 height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
                 width  = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
 
@@ -445,7 +520,7 @@ def main(
                         ).videos
                         save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{idx}.gif")
                         samples.append(sample)
-                        
+
                     else:
                         sample = validation_pipeline(
                             prompt,
@@ -457,27 +532,45 @@ def main(
                         ).images[0]
                         sample = torchvision.transforms.functional.to_tensor(sample)
                         samples.append(sample)
-                
+
                 if not image_finetune:
                     samples = torch.concat(samples)
                     save_path = f"{output_dir}/samples/sample-{global_step}.gif"
                     save_videos_grid(samples, save_path)
-                    
+
                 else:
                     samples = torch.stack(samples)
                     save_path = f"{output_dir}/samples/sample-{global_step}.png"
                     torchvision.utils.save_image(samples, save_path, nrow=4)
 
                 logging.info(f"Saved samples to {save_path}")
-                
+
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
-            
+
             if global_step >= max_train_steps:
                 break
-            
+
     dist.destroy_process_group()
 
+
+def save_mm(unet, mm_path):
+    mm_state_dict = OrderedDict()
+    state_dict = unet.state_dict()
+    for key in state_dict:
+        if "motion_module" in key:
+            mm_state_dict[key] = state_dict[key]
+    torch.save(mm_state_dict, mm_path)
+
+
+def save_lora(unet, lora_path):
+    unwarped_unet = unet.module if isinstance(unet, torch.nn.DataParallel) else unet
+    unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwarped_unet))
+    StableDiffusionPipeline.save_lora_weights(
+        save_directory=lora_path,
+        unet_lora_layers=unet_lora_state_dict,
+        safe_serialization=True,
+    )
 
 
 if __name__ == "__main__":
