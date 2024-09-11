@@ -38,7 +38,6 @@ from animatediff.pipelines.pipeline_animation import AnimationPipeline
 from animatediff.utils.util import save_videos_grid, zero_rank_print
 from animatediff.utils.convert_from_ckpt import \
     convert_ldm_unet_checkpoint, convert_ldm_vae_checkpoint, convert_ldm_clip_checkpoint
-from animatediff.utils.convert_state_dict_to_diffusers import convert_state_dict_to_diffusers
 from peft import get_peft_model, LoraConfig
 from peft.utils import get_peft_model_state_dict
 from collections import OrderedDict
@@ -374,6 +373,7 @@ def main(
 
     # Support mixed-precision training
     scaler = torch.amp.GradScaler("cuda") if mixed_precision_training else None
+    lowest_loss = float("inf")
 
     for epoch in range(first_epoch, num_train_epochs):
         train_dataloader.sampler.set_epoch(epoch)
@@ -477,24 +477,31 @@ def main(
             # Save checkpoint
             if is_main_process and (global_step % checkpointing_steps == 0 or global_step == max_train_steps):
                 save_path = os.path.join(output_dir, f"checkpoints")
+                unwarpped_unet = unet.module if isinstance(unet, torch.nn.parallel.DistributedDataParallel) else unet
                 state_dict = {
                     "epoch": epoch,
                     "global_step": global_step,
-                    "state_dict": unet.state_dict(),
+                    "state_dict": unwarpped_unet.state_dict(),
                 }
-                if global_step % checkpointing_steps == 0:
-                    torch.save(state_dict, os.path.join(save_path, f"checkpoint-step-{global_step}.ckpt"))
-                    if train_lora:
-                        unet.module.save_pretrained(os.path.join(save_path, f"lora-step-{global_step}"))
-                    if motion_module is not None:
-                        save_mm(unet, os.path.join(save_path, f"motion_module-step-{global_step}.ckpt"))
-                else:
-                    torch.save(state_dict, os.path.join(save_path, f"checkpoint.ckpt"))
-                    if train_lora:
-                        unet.module.save_pretrained(os.path.join(save_path, f"lora"))
-                    if motion_module is not None:
-                        save_mm(unet, os.path.join(save_path, f"motion_module.ckpt"))
+
+                torch.save(state_dict, os.path.join(save_path, f"checkpoint-step-{global_step}.ckpt"))
+                if train_lora:
+                    save_lora(unwarpped_unet, os.path.join(save_path, f"lora-step-{global_step}.ckpt"))
+                if motion_module is not None:
+                    save_mm(unwarpped_unet, os.path.join(save_path, f"motion_module-step-{global_step}.ckpt"))
+                if global_step == max_train_steps:
+                    unwarpped_unet.save_pretrained(os.path.join(save_path, f"lora"))
+
                 logging.info(f"Saved state to {save_path} (global_step: {global_step})")
+
+            if loss.item() < lowest_loss and (train_lora or motion_module is not None):
+                lowest_loss = loss.item()
+                unwarpped_unet = unet.module if isinstance(unet, torch.nn.parallel.DistributedDataParallel) else unet
+                if train_lora:
+                    save_lora(unwarpped_unet, os.path.join(output_dir, f"best_lora_checkpoint.ckpt"))
+                if motion_module is not None:
+                    save_mm(unwarpped_unet, os.path.join(output_dir, f"best_motion_module.ckpt"))
+                logging.info(f"New best model found at step {global_step} with loss {lowest_loss:.6f}, saving...")
 
             # Periodically validation
             if is_main_process and (global_step % validation_steps == 0 or global_step in validation_steps_tuple):
@@ -554,23 +561,51 @@ def main(
     dist.destroy_process_group()
 
 
-def save_mm(unet, mm_path):
+def save_mm(unet, mm_path, skip_lora=False, lora_alpha=0.3):
     mm_state_dict = OrderedDict()
     state_dict = unet.state_dict()
+
     for key in state_dict:
+        if "lora_" in key:
+            continue
+
         if "motion_module" in key:
-            mm_state_dict[key] = state_dict[key]
+            new_key = key.replace("base_model.model.", "").replace(".base_layer", "")
+            if ".base_layer" in key and not skip_lora:
+                value_A = state_dict[key.replace(".base_layer", ".lora_A.default")].to(torch.float32)
+                value_B = state_dict[key.replace(".base_layer", ".lora_B.default")].to(torch.float32)
+                lora_weight = lora_alpha * torch.mm(value_B, value_A)
+                mm_state_dict[new_key] = state_dict[key] + lora_weight
+            else:
+                mm_state_dict[new_key] = state_dict[key]
+
     torch.save(mm_state_dict, mm_path)
 
 
-def save_lora(unet, lora_path):
-    unwarped_unet = unet.module if isinstance(unet, torch.nn.DataParallel) else unet
-    unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwarped_unet))
-    StableDiffusionPipeline.save_lora_weights(
-        save_directory=lora_path,
-        unet_lora_layers=unet_lora_state_dict,
-        safe_serialization=True,
-    )
+def save_lora(unet, lora_path, with_mm=True):
+    lora_state_dict = OrderedDict()
+    unet_lora_state_dict = get_peft_model_state_dict(unet)
+
+    for key in unet_lora_state_dict:
+        new_key = key.replace("base_model.model.", "").replace("lora_A", "lora_down").replace("lora_B", "lora_up")
+        if "motion_modules" in key:
+            if not with_mm:
+                continue
+            new_key = "lora_mm_" + convert_to_lora_format(new_key)
+        else:
+            new_key = "lora_unet_" + convert_to_lora_format(new_key)
+
+        lora_state_dict[new_key] = unet_lora_state_dict[key]
+    torch.save(lora_state_dict, lora_path)
+
+
+def convert_to_lora_format(key):
+    if ".lora" in key:
+        parts = key.split(".lora")
+        return parts[0].replace(".", "_") + ".lora" + parts[1]
+    else:
+        parts = key.split(".")
+        return "_".join(parts[:-1]) + "." + parts[-1]
 
 
 if __name__ == "__main__":
